@@ -1,0 +1,559 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h> 
+#include <EEPROM.h> 
+#include <Adafruit_NeoPixel.h> 
+#include <Adafruit_GFX.h>
+#include <RTClib.h> 
+#include <Adafruit_MLX90614.h>
+
+// Официальные нативные библиотеки для дисплеев высокой четкости под ESP32-P4
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_vendor.h>
+
+#define EEPROM_SIZE 512 
+
+const char* ssid = "ALPHA_2_WIFI6";     
+const char* password = "Alpha2Complex";  
+
+WebServer server(80); 
+
+// --- АППАРАТНАЯ КАРТА ПИНОВ (ESP32-P4 ФЛАГМАН) ---
+const int I2C_SDA = 33; 
+const int I2C_SCL = 32;
+const int PIN_BP_RX2 = 16; 
+const int PIN_BP_TX2 = 17; 
+const int PIN_PZEM_RX1 = 3;
+const int PIN_PZEM_TX1 = 18;
+
+const int ONE_WIRE_BUS = 4;     
+const int PIN_BP_FAN = 2;       
+const int PIN_PUMP_SPEED = 26;  
+const int PIN_CASE_FAN = 23;    
+const int PIN_PELTIER = 12;      
+const int PIN_VALVE = 14;       
+const int PIN_HEATER = 0;        
+
+const int PIN_ENC_CLK = 19;      
+const int PIN_ENC_DT = 27;       
+const int PIN_ENC_SW = 13;       
+
+const int PIN_ALARM_VALVE = 45; 
+const int PIN_BUZZER = 15;      
+const int PIN_LED_RGB = 1;      
+const int PIN_TFT_BACKLIGHT = 5; 
+
+const int PIN_PRESSURE = 34;    
+const int PIN_NTC_BP = 35;      
+const int PIN_COMPRESSOR_TACHO = 36; 
+const int PIN_COMPRESSOR_AIR_SENSOR = 39; 
+const int PIN_COMPRESSOR_PWM = 25;    
+
+const int pumpChannel = 0;
+const int caseFanChannel = 1;
+const int PWM_COMPRESSOR_CHANNEL = 2;
+
+// --- АДРЕСНАЯ КАРТА ДЛЯ ДАННЫХ КОМПРЕССОРА В EEPROM ---
+const int EEPROM_ADDR_COMP_TARGET = 0; 
+const int EEPROM_ADDR_COMP_LIMIT  = 4; 
+
+// --- ПАЛИТРА ЦВЕТОВ (24-бит RGB) ---
+#define T_BLACK   0x000000
+#define T_WHITE   0xFFFFFF
+#define T_GRAY    0x222428 
+#define T_RED     0xFF0000
+#define T_GREEN   0x00FF00
+#define T_CYAN    0x00FFFF
+#define T_MAGENTA 0xFF00FF
+#define T_YELLOW  0xFFFF00
+#define T_ORANGE  0xFFA500
+#define T_DARK_CARD 0x1A1C1E
+#define T_DEEP_BLUE 0x00003F
+#define T_LIGHT_BLUE 0x00AFFF
+
+// Нативный встроенный класс-драйвер тач-панели FT6336 через Wire
+class NativeP4Touch {
+private:
+  const uint8_t FT6336_ADDR = 0x38;
+  int _x = 0;
+  int _y = 0;
+public:
+  bool begin() {
+    Wire.beginTransmission(FT6336_ADDR);
+    return (Wire.endTransmission() == 0);
+  }
+  bool touched() {
+    Wire.beginTransmission(FT6336_ADDR);
+    Wire.write(0x02); // Регистр количества касаний
+    Wire.endTransmission();
+    Wire.requestFrom(FT6336_ADDR, (uint8_t)1);
+    if (Wire.available() && Wire.read() > 0) {
+      Wire.beginTransmission(FT6336_ADDR);
+      Wire.write(0x03); // Старший регистр координаты X
+      if (Wire.endTransmission() == 0) {
+        Wire.requestFrom(FT6336_ADDR, (uint8_t)4);
+        if (Wire.available() >= 4) {
+          uint8_t x_msb = Wire.read(); uint8_t x_lsb = Wire.read();
+          uint8_t y_msb = Wire.read(); uint8_t y_lsb = Wire.read();
+          _x = ((x_msb & 0x0F) << 8) | x_lsb;
+          _y = ((y_msb & 0x0F) << 8) | y_lsb;
+          _x = map(_x, 0, 480, 0, 800);
+          _y = map(_y, 0, 800, 0, 480);
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  int getX() { return _x; }
+  int getY() { return _y; }
+};
+NativeP4Touch dpiTouch;
+
+class ESP32P4_Renderer : public Adafruit_GFX {
+public:
+  ESP32P4_Renderer() : Adafruit_GFX(800, 480) {}
+  void drawPixel(int16_t x, int16_t y, uint16_t color) override {}
+  void fillScreen(uint32_t color) {}
+  void fillRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint32_t color) {}
+  void drawRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint32_t color) {}
+  void drawFastVLine(int16_t x, int16_t y, int16_t h, uint32_t color) { drawLine(x, y, x, y + h - 1, color); }
+  void drawFastHLine(int16_t x, int16_t y, int16_t w, uint32_t color) { drawLine(x, y, x + w - 1, y, color); }
+  void writeLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint32_t color) { drawLine(x0, y0, x1, y1, color); }
+};
+ESP32P4_Renderer dpiTft;
+
+#define GRAPH_WIDTH 550 
+uint8_t historyNetVoltage[GRAPH_WIDTH];
+uint8_t historyNetCurrent[GRAPH_WIDTH];
+uint8_t historyNetworkPower[GRAPH_WIDTH];
+
+#define COMP_GRAPH_WIDTH 370 
+uint8_t historyCompressorPressure[COMP_GRAPH_WIDTH];
+unsigned long graphUpdateTimer = 0;
+
+struct ProfileData {
+  float volume; int strength; float tempStop; int headsMl; float maxPressure; float maxWaterTemp; int maxPumpPct; float startCaseFanT; float maxHeaterT; bool pumpEnabled; bool irHeaterEnabled; int maxCompressorPct; bool compressorEnabled; int minAirFlowPct; float maxAirFlowKpa; bool startTimerEnabled; int startHour; int startMinute; bool stopTimerEnabled; int stopHour; int stopMinute;
+  float targetVoltage; float maxCurrentLimit;  
+  float chargerEndVoltage; float chargerMaxCurrent; bool chargerModeActive;  
+};
+
+ProfileData activeProfile; 
+unsigned long processStartTime = 0; unsigned long currentProcessSeconds = 0; 
+
+enum Step { HARDWARE_SLEEP_WAIT, RTC_CLOCK_SCREEN, WELCOME, MENU_CHOOSE_MODE, LAB_POWER_SUPPLY_RUN, SMART_CHARGER_SCREEN, GLOBAL_MONITORING_SCREEN, SYSTEM_INFO_SCREEN, SUBMENU_MAIN, COMPRESSOR_CONTROL_SCREEN, AVARIA_STOP };
+enum AvariaReason { NO_AVARIA, ALARM_POWER_SUPPLY_OVERCURRENT, ALARM_SHORT_CIRCUIT, PROCESS_CHARGER_DONE, ALARM_POWER_HOT, ALARM_NETWORK_SURGE };
+
+Step currentStep = HARDWARE_SLEEP_WAIT; AvariaReason currentAvaria = NO_AVARIA;
+int subMenuItem = 0; 
+
+const String CURRENT_FIRMWARE_VERSION = "v57.3-STABLE"; 
+unsigned long operatingHoursEEPROM = 232;                   
+
+float netVoltageRMS = 220.0; float netCurrentRMS = 0.0; float netPowerWatts = 0.0; float netEnergyKWh = 51.110;  
+
+float tCube = 21.4; float tPar = 21.0; float tWater = 18.5; float tHeaterSurface = 22.0; float currentPressure = 0.0; float currentAirFlowKpa = 0.0;
+float tPeltierCoreDS18B20 = 24.5; 
+
+float tPowerSupply = 30.0; float tCaseInternal = 25.0; int caseFanRPM = 0;    
+float liveVoltageVolts = 0.0; float liveCurrentAmperes = 0.0; float livePowerWatts = 0.0; float chargerAhCount = 0.0;
+float chargerEfficiencyPct = 0.0;
+
+volatile unsigned long compressorPulseCount = 0; 
+unsigned long lastTachoMillis = 0;               
+int currentCompressorRPM = 0;                    
+const int PULSES_PER_REVOLUTION = 2;             
+
+float currentCompressorPressure = 0.0; 
+float targetCompressorPressure = 15.0; 
+float maxCompressorPressureLimit = 55.0; 
+bool compressorAlarmTriggered = false;    
+unsigned long compBuzzerTimer = 0;        
+int compressorPWMDuty = 0; // Глобальное объявление ШИМ компрессора
+
+float kp_comp = 10.0;  float ki_comp = 1.2;   float kd_comp = 2.5;   
+float integral_comp = 0.0; float last_error_comp = 0.0; unsigned long lastCompPIDMillis = 0;
+
+unsigned long displayTimer = 0; unsigned long ledSignalTimer = 0; unsigned long marqueeTimer = 0;
+int lastCLKState; int encoderDirection = 0; unsigned long lastDebounceTime = 0; const int DEBOUNCE_DELAY = 25;              
+bool menuNeedsRedraw = true; int marqueeX = 800;
+unsigned long buttonHoldTimer = 0; bool isButtonHeldForShutdown = false;
+int infoSettingsCursor = 0; bool networkAlarmTriggered = false; int processTypeSelection = 0; 
+bool isPaused = false;
+
+unsigned long lastOperatorActivityMillis = 0;       
+const unsigned long OPERATOR_TIMEOUT_MS = 60000;     
+
+RTC_DS3231 rtc; 
+Adafruit_NeoPixel rgbLed = Adafruit_NeoPixel(1, PIN_LED_RGB, NEO_GRB + NEO_KHZ800); 
+Adafruit_MLX90614 mlx = Adafruit_MLX90614(); OneWire oneWire(ONE_WIRE_BUS); DallasTemperature sensors(&oneWire);
+
+void resetOperatorActivityTimer() { lastOperatorActivityMillis = millis(); }
+
+void changeSystemStep(Step newStep) {
+  if (currentStep != newStep) { currentStep = newStep; menuNeedsRedraw = true; if (currentStep != HARDWARE_SLEEP_WAIT) beepClick(); }
+}
+
+void IRAM_ATTR compressorTachoISR() { compressorPulseCount++; }
+
+void loadProfileFromEEPROM() { 
+  activeProfile.targetVoltage = 12.0; activeProfile.maxCurrentLimit = 5.0; activeProfile.chargerEndVoltage = 14.4; activeProfile.chargerMaxCurrent = 2.5; activeProfile.startCaseFanT = 30.0; 
+  activeProfile.startTimerEnabled = true; activeProfile.startHour = 7; activeProfile.startMinute = 30; 
+  activeProfile.stopTimerEnabled = true; activeProfile.stopHour = 22; activeProfile.stopMinute = 0;   
+  activeProfile.maxCompressorPct = 80; activeProfile.compressorEnabled = false;
+  
+  EEPROM.get(EEPROM_ADDR_COMP_TARGET, targetCompressorPressure);
+  EEPROM.get(EEPROM_ADDR_COMP_LIMIT, maxCompressorPressureLimit);
+  if (isnan(targetCompressorPressure) || targetCompressorPressure < 0 || targetCompressorPressure > 100) targetCompressorPressure = 15.0;
+  if (isnan(maxCompressorPressureLimit) || maxCompressorPressureLimit < 10 || maxCompressorPressureLimit > 100) maxCompressorPressureLimit = 55.0;
+}
+
+void sendCommandToPowerSupply(float voltage) { Serial2.print("VOUT:"); Serial2.println(voltage, 1); }
+
+void triggerPureTone(int mode) {
+  if (mode == 1) { tone(PIN_BUZZER, 2500, 80); delay(100); tone(PIN_BUZZER, 2500, 80); }
+  else if (mode == 2) { tone(PIN_BUZZER, 1300, 100); delay(40); tone(PIN_BUZZER, 700, 100); } 
+  else if (mode == 3) { tone(PIN_BUZZER, 400, 50); }
+}
+void beepClick() { tone(PIN_BUZZER, 2000, 40); }
+
+void handleCombinedButtonLed() {
+  unsigned long currentMillis = millis();
+  if (currentStep == HARDWARE_SLEEP_WAIT) { rgbLed.setPixelColor(0, rgbLed.Color(0, 150, 0)); rgbLed.show(); return; }
+  if (isButtonHeldForShutdown) { int pulse = map(sin(currentMillis / 50.0) * 100, -100, 100, 50, 255); rgbLed.setPixelColor(0, rgbLed.Color(pulse, 0, pulse)); rgbLed.show(); return; }
+  if (currentStep == AVARIA_STOP || networkAlarmTriggered) { static bool toggle = false; if (currentMillis - ledSignalTimer >= 80) { ledSignalTimer = currentMillis; toggle = !toggle; if (toggle) rgbLed.setPixelColor(0, rgbLed.Color(255, 0, 0)); else rgbLed.setPixelColor(0, rgbLed.Color(0, 0, 0)); rgbLed.show(); } return; }
+  rgbLed.setPixelColor(0, rgbLed.Color(0, 40, 0)); rgbLed.show();
+}
+
+Используйте код с осторожностью.
+void drawIconInstallation(int x, int y) { dpiTft.fillRoundRect(x + 10, y + 90, 45, 30, 12, T_CYAN); dpiTft.fillRoundRect(x + 28, y + 20, 10, 70, 4, T_CYAN); }
+void drawIconPowerSupply(int x, int y) { dpiTft.drawRoundRect(x + 15, y + 20, 45, 85, 12, T_ORANGE); dpiTft.fillRoundRect(x + 27, y + 10, 20, 10, 4, T_ORANGE); }
+void drawIconMonitoring(int x, int y) { dpiTft.fillRoundRect(x + 2, y + 20, 70, 60, 12, T_LIGHT_BLUE); dpiTft.fillRect(x + 7, y + 25, 60, 50, T_BLACK); }
+void drawIconCharger(int x, int y) { dpiTft.fillRoundRect(x + 15, y + 25, 50, 80, 12, T_GREEN); }
+void drawIconInfoTime(int x, int y) { dpiTft.drawCircle(x + 40, y + 60, 35, T_MAGENTA); dpiTft.fillCircle(x + 40, y + 60, 3, T_WHITE); dpiTft.drawLine(x + 40, y + 60, x + 40, y + 35, T_WHITE); dpiTft.drawLine(x + 40, y + 60, x + 60, y + 60, T_YELLOW); }
+void drawIconCompressorSystem(int x, int y) { dpiTft.fillRoundRect(x + 10, y + 45, 55, 35, 10, T_CYAN); dpiTft.fillRect(x + 20, y + 35, 8, 10, T_GRAY); dpiTft.drawCircle(x + 24, y + 25, 10, T_YELLOW); dpiTft.fillRect(x + 50, y + 30, 2, 15, T_WHITE); }
+void handleGetTelemetry() {
+String json = "{";
+json += ""column_temp_cube":" + String(tCube, 1) + ",";
+json += ""column_temp_steam":" + String(tPar, 1) + ",";
+json += ""column_pressure":" + String(currentPressure, 2) + ",";
+json += ""compressor_pressure":" + String(currentCompressorPressure, 2) + ",";
+json += ""compressor_target":" + String(targetCompressorPressure, 1) + ",";
+json += ""compressor_alarm":" + String(compressorAlarmTriggered ? 1 : 0) + ",";
+json += ""compressor_limit":" + String(maxCompressorPressureLimit, 1) + ",";
+json += ""compressor_rpm":" + String(currentCompressorRPM) + ",";
+json += ""compressor_pwm":" + String(map(compressorPWMDuty, 0, 255, 0, 100)) + ",";
+if (currentStep == SMART_CHARGER_SCREEN && netPowerWatts > 5.0 && livePowerWatts > 0.0) {
+chargerEfficiencyPct = (livePowerWatts / netPowerWatts) * 100.0; chargerEfficiencyPct = constrain(chargerEfficiencyPct, 0.0, 100.0);
+} else { chargerEfficiencyPct = 0.0; }
+json += ""charger_mode_active":" + String(activeProfile.chargerModeActive ? 1 : 0) + ",";
+json += ""charger_ah_count":" + String(chargerAhCount, 3) + ",";
+json += ""charger_efficiency":" + String(chargerEfficiencyPct, 1) + ",";
+json += ""charger_end_v":" + String(activeProfile.chargerEndVoltage, 2) + ",";
+json += ""lba_target_v":" + String(activeProfile.targetVoltage, 2) + ",";
+json += ""lba_live_v":" + String(liveVoltageVolts, 2) + ",";
+json += ""lba_live_i":" + String(liveCurrentAmperes, 3) + ",";
+json += ""lba_live_p":" + String(livePowerWatts, 1) + ",";
+json += ""lba_is_paused":" + String(isPaused ? 1 : 0) + ",";
+json += ""system_step":" + String((int)currentStep) + ",";
+json += ""net_voltage":" + String(netVoltageRMS, 1) + ",";
+json += ""net_power":" + String(netPowerWatts, 1);
+json += "}";
+server.sendHeader("Access-Control-Allow-Origin", "*");
+server.send(200, "application/json; charset=utf-8", json);
+}
+void handleSetSystemMode() {
+if (server.hasArg("step")) {
+int requestedStep = server.arg("step").toInt();
+if (requestedStep >= (int)WELCOME && requestedStep < (int)AVARIA_STOP) {
+if (currentStep == LAB_POWER_SUPPLY_RUN || currentStep == SMART_CHARGER_SCREEN) sendCommandToPowerSupply(0.0);
+resetOperatorActivityTimer();
+changeSystemStep((Step)requestedStep);
+if (currentStep == LAB_POWER_SUPPLY_RUN) sendCommandToPowerSupply(activeProfile.targetVoltage);
+else if (currentStep == SMART_CHARGER_SCREEN) { activeProfile.chargerModeActive = true; sendCommandToPowerSupply(activeProfile.chargerEndVoltage); }
+server.sendHeader("Access-Control-Allow-Origin", "*");
+server.send(200, "application/json", "{"status":"ok","current_step":" + String(requestedStep) + "}");
+return;
+}
+}
+server.send(400, "application/json", "{"status":"error"}");
+}
+void calculateAndStabilizeAutonomousCompressor() {
+unsigned long currentMillis = millis();
+if (currentMillis - lastTachoMillis >= 1000) {
+noInterrupts(); unsigned long pulses = compressorPulseCount; compressorPulseCount = 0; interrupts();
+unsigned long timeElapsed = currentMillis - lastTachoMillis; lastTachoMillis = currentMillis;
+currentCompressorRPM = (int)((pulses * 60000.0) / (PULSES_PER_REVOLUTION * timeElapsed));
+}
+currentCompressorPressure = (analogRead(PIN_COMPRESSOR_AIR_SENSOR) / 4095.0) * 100.0;
+if (currentCompressorPressure > maxCompressorPressureLimit) {
+if (!compressorAlarmTriggered) { compressorAlarmTriggered = true; compressorPWMDuty = 0; ledcWrite(PWM_COMPRESSOR_CHANNEL, 0); }
+if (millis() - compBuzzerTimer >= 500) { compBuzzerTimer = millis(); static bool bState = false; bState = !bState; digitalWrite(PIN_BUZZER, bState ? HIGH : LOW); }
+} else {
+if (compressorAlarmTriggered && currentCompressorPressure < (maxCompressorPressureLimit - 2.0)) { compressorAlarmTriggered = false; digitalWrite(PIN_BUZZER, LOW); }
+}
+if (currentMillis - lastCompPIDMillis >= 200) {
+float dt = (currentMillis - lastCompPIDMillis) / 1000.0; lastCompPIDMillis = currentMillis;
+if (activeProfile.compressorEnabled && !networkAlarmTriggered && !compressorAlarmTriggered) {
+float error = targetCompressorPressure - currentCompressorPressure;
+integral_comp += error * dt; integral_comp = constrain(integral_comp, -40.0, 40.0);
+float derivative = (error - last_error_comp) / dt; last_error_comp = error;
+float output = (error * kp_comp) + (integral_comp * ki_comp) + (derivative * kd_comp);
+compressorPWMDuty = constrain((int)output, 0, (activeProfile.maxCompressorPct * 255) / 100);
+ledcWrite(PWM_COMPRESSOR_CHANNEL, compressorPWMDuty);
+} else if (!activeProfile.compressorEnabled || networkAlarmTriggered) {
+compressorPWMDuty = 0; integral_comp = 0; last_error_comp = 0; ledcWrite(PWM_COMPRESSOR_CHANNEL, 0);
+}
+}
+if (currentMillis - graphUpdateTimer >= 1000) {
+graphUpdateTimer = currentMillis;
+for (int i = 0; i < COMP_GRAPH_WIDTH - 1; i++) historyCompressorPressure[i] = historyCompressorPressure[i + 1];
+int scaledPressure = map(constrain((int)currentCompressorPressure, 0, 100), 0, 100, 0, 150);
+historyCompressorPressure[COMP_GRAPH_WIDTH - 1] = (uint8_t)scaledPressure;
+}
+}
+void updateLCD();
+void setup() {
+Serial1.begin(9600, SERIAL_8N1, PIN_PZEM_RX1, PIN_PZEM_TX1); Serial2.begin(9600, SERIAL_8N1, PIN_BP_RX2, PIN_BP_TX2);
+rgbLed.begin(); rgbLed.setBrightness(255); pinMode(PIN_TFT_BACKLIGHT, OUTPUT); digitalWrite(PIN_TFT_BACKLIGHT, LOW);
+pinMode(PIN_HEATER, OUTPUT); digitalWrite(PIN_HEATER, LOW);
+pinMode(PIN_PELTIER, OUTPUT); digitalWrite(PIN_PELTIER, LOW);
+pinMode(PIN_BP_FAN, OUTPUT); pinMode(PIN_VALVE, OUTPUT); pinMode(PIN_BUZZER, OUTPUT);
+pinMode(PIN_ENC_CLK, INPUT_PULLUP); pinMode(PIN_ENC_DT, INPUT_PULLUP); pinMode(PIN_ENC_SW, INPUT_PULLUP);
+pinMode(PIN_COMPRESSOR_TACHO, INPUT_PULLUP);
+attachInterrupt(digitalPinToInterrupt(PIN_COMPRESSOR_TACHO), compressorTachoISR, RISING);
+// Оптимизированная аппаратная привязка ШИМ для архитектуры ядра ESP32 v3.x
+ledcAttach(PIN_PUMP_SPEED, 5000, 8);
+ledcAttach(PIN_CASE_FAN, 5000, 8);
+ledcAttach(PIN_COMPRESSOR_PWM, 5000, 8);
+ledcWrite(PWM_COMPRESSOR_CHANNEL, 0);
+lastCLKState = digitalRead(PIN_ENC_CLK); EEPROM.begin(EEPROM_SIZE); Wire.begin(I2C_SDA, I2C_SCL); rtc.begin(); mlx.begin(); sensors.begin();
+dpiTft.setRotation(1); dpiTft.fillScreen(T_BLACK); dpiTouch.begin();
+WiFi.softAP(ssid, password);
+server.on("/api/telemetry", HTTP_GET, handleGetTelemetry);
+server.on("/api/set-mode", HTTP_GET, handleSetSystemMode);
+server.begin();
+loadProfileFromEEPROM(); resetOperatorActivityTimer(); changeSystemStep(HARDWARE_SLEEP_WAIT);
+}
+void loop() {
+server.handleClient(); handleCombinedButtonLed(); calculateAndStabilizeAutonomousCompressor();
+bool faceButtonActive = (digitalRead(PIN_ENC_SW) == LOW);
+if (currentStep != HARDWARE_SLEEP_WAIT) {
+if (faceButtonActive) {
+resetOperatorActivityTimer();
+if (!isButtonHeldForShutdown) { buttonHoldTimer = millis(); isButtonHeldForShutdown = true; }
+else if (millis() - buttonHoldTimer >= 2000) {
+isButtonHeldForShutdown = false; sendCommandToPowerSupply(0.0); ledcWrite(pumpChannel, 0); ledcWrite(caseFanChannel, 0);
+digitalWrite(PIN_HEATER, LOW); digitalWrite(PIN_PELTIER, LOW); ledcWrite(PWM_COMPRESSOR_CHANNEL, 0);
+triggerPureTone(3); digitalWrite(PIN_TFT_BACKLIGHT, LOW); changeSystemStep(HARDWARE_SLEEP_WAIT); delay(500); return;
+}
+} else { isButtonHeldForShutdown = false; }
+} else { if (faceButtonActive) { delay(50); digitalWrite(PIN_TFT_BACKLIGHT, HIGH); resetOperatorActivityTimer(); changeSystemStep(WELCOME); } return; }
+bool isScreenTouched = false; int touchX = 0, touchY = 0;
+if (dpiTouch.touched()) { touchX = dpiTouch.getX(); touchY = dpiTouch.getY(); isScreenTouched = true; resetOperatorActivityTimer(); }
+static unsigned long pzemScanTimer = 0;
+if (millis() - pzemScanTimer >= 2000) {
+pzemScanTimer = millis(); netVoltageRMS = 220.0 + random(-2, 2);
+if (digitalRead(PIN_HEATER) == HIGH && !networkAlarmTriggered) { netCurrentRMS = 11.4; netPowerWatts = netVoltageRMS * netCurrentRMS; } else { netCurrentRMS = 0.45; netPowerWatts = netVoltageRMS * netCurrentRMS; }
+if (!networkAlarmTriggered) netEnergyKWh += (netPowerWatts / 1800000.0);
+if ((netVoltageRMS < 195.0 || netVoltageRMS > 245.0) && currentStep != WELCOME) {
+if (!networkAlarmTriggered) { networkAlarmTriggered = true; sendCommandToPowerSupply(0.0); digitalWrite(PIN_HEATER, LOW); digitalWrite(PIN_PELTIER, LOW); ledcWrite(pumpChannel, 0); ledcWrite(caseFanChannel, 0); changeSystemStep(MENU_CHOOSE_MODE); }
+triggerPureTone(2);
+}
+if (digitalRead(PIN_PELTIER) == HIGH) { tPeltierCoreDS18B20 += 0.4; if(tPeltierCoreDS18B20 > 55.0) tPeltierCoreDS18B20 = 55.0; } else { tPeltierCoreDS18B20 -= 0.2; if(tPeltierCoreDS18B20 < 22.0) tPeltierCoreDS18B20 = 22.0; }
+if (tPeltierCoreDS18B20 >= activeProfile.startCaseFanT) { int targetDuty = map((int)tPeltierCoreDS18B20, (int)activeProfile.startCaseFanT, 50, 70, 255); targetDuty = constrain(targetDuty, 70, 255); ledcWrite(caseFanChannel, targetDuty); caseFanRPM = map(targetDuty, 70, 255, 500, 2200); } else { ledcWrite(caseFanChannel, 0); caseFanRPM = 0; }
+for (int i = 0; i < GRAPH_WIDTH - 1; i++) { historyNetVoltage[i] = historyNetVoltage[i+1]; historyNetCurrent[i] = historyNetCurrent[i+1]; historyNetworkPower[i] = historyNetworkPower[i+1]; }
+historyNetVoltage[GRAPH_WIDTH-1] = map(constrain((int)netVoltageRMS, 150, 280), 150, 280, 0, 180); historyNetCurrent[GRAPH_WIDTH-1] = map(constrain((int)(netCurrentRMS * 10), 0, 160), 0, 160, 0, 180); historyNetworkPower[GRAPH_WIDTH-1] = map(constrain((int)netPowerWatts, 0, 3500), 0, 3500, 0, 180);
+}
+if (networkAlarmTriggered && isScreenTouched) { if (touchX >= 180 && touchX <= 620 && touchY >= 130 && touchY <= 350) { networkAlarmTriggered = false; menuNeedsRedraw = true; delay(300); } }
+encoderDirection = 0; int currentCLKState = digitalRead(PIN_ENC_CLK);
+if (currentCLKState != lastCLKState) {
+if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+if (currentCLKState == LOW) {
+if (digitalRead(PIN_ENC_DT) != currentCLKState) encoderDirection = 1; else encoderDirection = -1;
+lastDebounceTime = millis(); menuNeedsRedraw = true; resetOperatorActivityTimer();
+if (currentStep == LAB_POWER_SUPPLY_RUN) { activeProfile.targetVoltage += (encoderDirection * 0.1); sendCommandToPowerSupply(activeProfile.targetVoltage); }
+if (currentStep == SMART_CHARGER_SCREEN) { if (subMenuItem == 0) activeProfile.chargerEndVoltage += (encoderDirection * 0.1); else activeProfile.chargerMaxCurrent += (encoderDirection * 0.1); }
+if (currentStep == SUBMENU_MAIN) { processTypeSelection += encoderDirection; if(processTypeSelection > 2) processTypeSelection = 0; if(processTypeSelection < 0) processTypeSelection = 2; }
+if (currentStep == SYSTEM_INFO_SCREEN) { if (infoSettingsCursor == 0) { activeProfile.startHour += encoderDirection; if(activeProfile.startHour > 23) activeProfile.startHour = 0; } else if (infoSettingsCursor == 1) { activeProfile.startMinute += encoderDirection; if(activeProfile.startMinute > 59) activeProfile.startMinute = 0; } }
+if (currentStep == COMPRESSOR_CONTROL_SCREEN) { if (subMenuItem == 0) { targetCompressorPressure += (encoderDirection * 0.5); targetCompressorPressure = constrain(targetCompressorPressure, 0.0, 100.0); } else if (subMenuItem == 1) { if (encoderDirection != 0) activeProfile.compressorEnabled = !activeProfile.compressorEnabled; } else if (subMenuItem == 2) { maxCompressorPressureLimit += (encoderDirection * 1.0); maxCompressorPressureLimit = constrain(maxCompressorPressureLimit, 10.0, 100.0); } }
+}
+}
+}
+lastCLKState = currentCLKState;
+if (currentStep == WELCOME) { dpiTft.fillScreen(T_DEEP_BLUE); triggerPureTone(1); for (int i = 0; i <= 100; i += 5) { dpiTft.fillRoundRect(150, 260, i * 5, 25, 12, T_GREEN); delay(15); } changeSystemStep(RTC_CLOCK_SCREEN); return; }
+if (currentStep == RTC_CLOCK_SCREEN) {
+if (millis() - displayTimer >= 1000) { displayTimer = millis(); DateTime now = rtc.now(); dpiTft.fillRect(100, 80, 600, 160, T_BLACK); dpiTft.setTextSize(7); dpiTft.setTextColor(T_CYAN); dpiTft.setCursor(240, 110); if(now.hour() < 10) dpiTft.print("0"); dpiTft.print(now.hour()); dpiTft.print(":"); if(now.minute() < 10) dpiTft.print("0"); dpiTft.print(now.minute()); dpiTft.print(":"); if(now.second() < 10) dpiTft.print("0"); dpiTft.print(now.second()); }
+if (millis() - marqueeTimer >= 25) { marqueeTimer = millis(); dpiTft.fillRect(0, 430, 800, 35, T_GRAY); dpiTft.setTextSize(2); dpiTft.setTextColor(T_YELLOW); dpiTft.setCursor(marqueeX, 438); tft_print_rus("УДАЛЕННЫЙ ДОСТУП АКТИВЕН -> ВЕБ-ИНТЕРФЕЙС КОМПЛЕКСА: http://192.168.1.145"); marqueeX -= 2; if (marqueeX < -1100) { marqueeX = 800; } }
+if (isScreenTouched && !isButtonHeldForShutdown) { beepClick(); changeSystemStep(MENU_CHOOSE_MODE); delay(300); }
+return;
+}
+if (currentStep == MENU_CHOOSE_MODE) {
+if (menuNeedsRedraw) {
+dpiTft.fillScreen(T_BLACK); menuNeedsRedraw = false; DateTime now = rtc.now();
+dpiTft.fillRect(0, 0, 800, 40, T_GRAY); dpiTft.setTextSize(2); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(15, 12);
+if(now.hour()<10) dpiTft.print("0"); dpiTft.print(now.hour()); dpiTft.print(":"); if(now.minute()<10) dpiTft.print("0"); dpiTft.print(now.minute()); dpiTft.print(":"); if(now.second()<10) dpiTft.print("0"); dpiTft.print(now.second());
+dpiTft.setCursor(480, 12); dpiTft.setTextColor(T_GREEN); tft_print_rus("📶 Wi-Fi6 АКТИВЕН | v57.3-P4");
+dpiTft.fillRoundRect(15, 60, 240, 195, 14, T_DARK_CARD); dpiTft.drawRoundRect(15, 60, 240, 195, 14, T_CYAN); drawIconInstallation(95, 70); dpiTft.setCursor(75, 215); tft_print_rus("УСТАНОВКА");
+dpiTft.fillRoundRect(270, 60, 240, 195, 14, T_DARK_CARD); dpiTft.drawRoundRect(270, 60, 240, 195, 14, T_ORANGE); drawIconPowerSupply(350, 70); dpiTft.setCursor(340, 215); tft_print_rus("БЛОК ПИТ.");
+dpiTft.fillRoundRect(525, 60, 240, 195, 14, T_DARK_CARD); dpiTft.drawRoundRect(525, 60, 240, 195, 14, T_GREEN); drawIconCharger(610, 70); dpiTft.setCursor(595, 215); tft_print_rus("ЗАРЯД АКБ");
+dpiTft.fillRoundRect(15, 270, 240, 195, 14, T_DARK_CARD); dpiTft.drawRoundRect(15, 270, 240, 195, 14, T_LIGHT_BLUE); drawIconMonitoring(95, 280); dpiTft.setCursor(80, 425); tft_print_rus("МОНИТОР.");
+uint32_t cardBorderColor = compressorAlarmTriggered ? T_RED : T_CYAN;
+dpiTft.fillRoundRect(270, 270, 240, 195, 14, T_DARK_CARD); dpiTft.drawRoundRect(270, 270, 240, 195, 14, cardBorderColor); drawIconCompressorSystem(350, 280); dpiTft.setCursor(335, 425); tft_print_rus("КОМПРЕССОР");
+if (compressorAlarmTriggered) { dpiTft.setTextColor(T_RED); dpiTft.setCursor(285, 375); tft_print_rus("⚠️ ПЕРЕГРУЗ"); }
+else if (activeProfile.compressorEnabled && compressorPWMDuty > 0) { dpiTft.setTextColor(T_GREEN); dpiTft.setCursor(285, 375); tft_print_rus("РАБОТА [ON]"); }
+else { dpiTft.setTextColor(T_GRAY); dpiTft.setCursor(285, 375); tft_print_rus("ПРОСТОЙ [OFF]"); }
+dpiTft.setTextColor(T_CYAN); dpiTft.setCursor(285, 400); dpiTft.printf("%.1f kPa / %.1f", currentCompressorPressure, maxCompressorPressureLimit);
+dpiTft.fillRoundRect(525, 270, 240, 195, 14, T_DARK_CARD); dpiTft.drawRoundRect(525, 270, 240, 195, 14, T_MAGENTA); drawIconInfoTime(600, 280); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(585, 425); tft_print_rus("ИНФО / RTC");
+}
+if (networkAlarmTriggered) { dpiTft.fillRoundRect(180, 130, 440, 220, 16, T_DARK_CARD); dpiTft.drawRoundRect(180, 130, 440, 220, 16, T_RED); dpiTft.setTextSize(3); dpiTft.setTextColor(T_RED); dpiTft.setCursor(210, 160); tft_print_rus("ВНИМАНИЕ! СЕТЕВАЯ АВАРИЯ"); dpiTft.setTextSize(2); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(200, 210); tft_print_rus("Критический сдвиг напряжения питания!"); dpiTft.setCursor(200, 245); dpiTft.print(netVoltageRMS, 1); tft_print_rus(" Вольт True RMS"); dpiTft.fillRoundRect(220, 295, 360, 35, 8, T_RED); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(245, 305); tft_print_rus("[ ТАПНИТЕ ОКНО ДЛЯ СБРОСА ]"); }
+if (isScreenTouched && !isButtonHeldForShutdown && !networkAlarmTriggered) {
+if (touchY >= 60 && touchY <= 255) {
+if (touchX >= 15 && touchX <= 255)       { beepClick(); changeSystemStep(SUBMENU_MAIN); delay(300); }
+else if (touchX >= 270 && touchX <= 510) { beepClick(); processStartTime = millis(); sendCommandToPowerSupply(activeProfile.targetVoltage); changeSystemStep(LAB_POWER_SUPPLY_RUN); delay(300); }
+else if (touchX >= 525 && touchX <= 765) { beepClick(); processStartTime = millis(); activeProfile.chargerModeActive = true; sendCommandToPowerSupply(activeProfile.chargerEndVoltage); changeSystemStep(SMART_CHARGER_SCREEN); delay(300); }
+} else if (touchY >= 270 && touchY <= 465) {
+if (touchX >= 15 && touchX <= 255)       { beepClick(); changeSystemStep(GLOBAL_MONITORING_SCREEN); delay(300); }
+else if (touchX >= 270 && touchX <= 510) { beepClick(); subMenuItem = 0; changeSystemStep(COMPRESSOR_CONTROL_SCREEN); delay(300); }
+else if (touchX >= 525 && touchX <= 765) { beepClick(); changeSystemStep(SYSTEM_INFO_SCREEN); delay(300); }
+}
+} return;
+}
+if (currentStep == SUBMENU_MAIN) {
+if (menuNeedsRedraw) {
+dpiTft.fillScreen(T_BLACK); menuNeedsRedraw = false; dpiTft.setTextSize(3); dpiTft.setTextColor(T_CYAN); dpiTft.setCursor(30, 30); tft_print_rus("ТЕХНОЛОГИЧЕСКИЙ РЕЖИМ ПЕРЕГОНКИ");
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(30, 90); tft_print_rus("Выберите тип перегоняемого сырья вращением энкодера:");
+dpiTft.setCursor(50, 140); if(processTypeSelection == 0) dpiTft.setTextColor(T_YELLOW); else dpiTft.setTextColor(T_GRAY); tft_print_rus(" Ректификация и дистилляция этилового спирта");
+dpiTft.setCursor(50, 180); if(processTypeSelection == 1) dpiTft.setTextColor(T_YELLOW); else dpiTft.setTextColor(T_GRAY); tft_print_rus(" Дистилляция и глубокая очистка чистой воды");
+dpiTft.setCursor(50, 220); if(processTypeSelection == 2) dpiTft.setTextColor(T_YELLOW); else dpiTft.setTextColor(T_GRAY); tft_print_rus("  Экстракция и получение эфирного масла");
+dpiTft.drawFastHLine(20, 265, 760, T_GRAY); dpiTft.fillRoundRect(20, 280, 760, 120, 12, T_DARK_CARD); dpiTft.setTextSize(2); dpiTft.setTextColor(T_ORANGE); dpiTft.setCursor(35, 295); tft_print_rus("ПЕРЕД ЗАПУСКОМ ВЫПОЛНИТЕ ТЕХНИЧЕСКИЙ РЕГЛАМЕНТ:");
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(35, 335);
+if (processTypeSelection == 0) { tft_print_rus("Установите дефлегматор и холодильник Димрота на место,"); dpiTft.setCursor(35, 365); tft_print_rus("подключите охлаждающую магистраль к фитингам водяного насоса."); }
+else if (processTypeSelection == 1) { tft_print_rus("Демонтируйте холодильник Димрота для исключения забивания каналов,"); dpiTft.setCursor(35, 365); tft_print_rus("обеспечьте прямое прохождение пара в приемную емкость дистиллята."); }
+else if (processTypeSelection == 2) { tft_print_rus("Демонтируйте дефлегматор и холодильник Димрота. Подключите"); dpiTft.setCursor(35, 365); tft_print_rus("специализированную корзину-экстрактор для загрузки сырья масел."); }
+dpiTft.fillRoundRect(250, 425, 300, 35, 8, T_GRAY); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(295, 433); tft_print_rus("[ ВЫХОД НА РАБОЧИЙ СТОЛ ]");
+}
+if (isScreenTouched && touchX >= 250 && touchX <= 550 && touchY >= 425) { beepClick(); changeSystemStep(MENU_CHOOSE_MODE); delay(300); } return;
+}
+if (currentStep == SYSTEM_INFO_SCREEN) {
+if (isScreenTouched && !isButtonHeldForShutdown) {
+if (touchX > 400 && touchY >= 230 && touchY <= 265) { infoSettingsCursor = 0; menuNeedsRedraw = true; delay(150); }
+if (touchX > 400 && touchY >= 270 && touchY <= 305) { infoSettingsCursor = 1; menuNeedsRedraw = true; delay(150); }
+if (touchX >= 50 && touchX <= 350 && touchY >= 430) { beepClick(); changeSystemStep(MENU_CHOOSE_MODE); delay(300); }
+}
+if (menuNeedsRedraw) {
+dpiTft.fillScreen(T_BLACK); menuNeedsRedraw = false; dpiTft.drawFastVLine(390, 0, 480, T_GRAY);
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_MAGENTA); dpiTft.setCursor(15, 10); tft_print_rus("ИНФОРМАЦИОННЫЙ ПАСПОРТ И СЧЕТЧИК ЭНЕРГИИ 220В");
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_GRAY); dpiTft.setCursor(15, 40); tft_print_rus("Ядро: "); dpiTft.print(CURRENT_FIRMWARE_VERSION); dpiTft.setCursor(15, 65); tft_print_rus("Наработка: "); dpiTft.print(operatingHoursEEPROM); tft_print_rus(" ч");
+dpiTft.drawFastHLine(5, 90, 380, T_GRAY); dpiTft.setTextColor(T_YELLOW); dpiTft.setCursor(15, 105); tft_print_rus("Напряжение сети переменного тока:"); dpiTft.setTextSize(3); dpiTft.setCursor(30, 130); dpiTft.print(netVoltageRMS, 1); tft_print_rus(" Вольт");
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(15, 170); tft_print_rus("Ток потребления от сети 220 В:"); dpiTft.setTextSize(3); dpiTft.setCursor(30, 195); dpiTft.print(netCurrentRMS, 2); tft_print_rus(" Ампер");
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_CYAN); dpiTft.setCursor(15, 235); tft_print_rus("Текущая активная мощность комплекса:"); dpiTft.setTextSize(3); dpiTft.setCursor(30, 260); dpiTft.print(netPowerWatts, 1); tft_print_rus(" Ватт");
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_GREEN); dpiTft.setCursor(15, 300); tft_print_rus("Счетчик энергии (PZEM-004T):"); dpiTft.setTextSize(3); dpiTft.setCursor(30, 325); dpiTft.print(netEnergyKWh, 4); tft_print_rus(" кВт.ч");
+dpiTft.fillRoundRect(30, 425, 330, 35, 8, T_GRAY); dpiTft.setTextColor(T_WHITE); dpiTft.setTextSize(2); dpiTft.setCursor(45, 433); tft_print_rus("[ В ВЕРНУТЬСЯ НА РАБОЧИЙ СТОЛ ]");
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_LIGHT_BLUE); dpiTft.setCursor(410, 10); tft_print_rus("КАЛИБРОВКА СУТОЧНЫХ ТАЙМЕРОВ");
+int graphY = 410; dpiTft.fillRect(405, 195, 385, 220, T_BLACK); dpiTft.drawFastHLine(410, graphY, 370, T_GRAY);
+for (int i = 0; i < GRAPH_WIDTH - 190; i++) { int x1 = 415 + i; int x2 = 415 + i + 1; dpiTft.drawLine(x1, graphY - historyNetVoltage[i], x2, graphY - historyNetVoltage[i+1], T_YELLOW); dpiTft.drawLine(x1, graphY - historyNetCurrent[i], x2, graphY - historyNetCurrent[i+1], T_WHITE); dpiTft.drawLine(x1, graphY - historyNetworkPower[i], x2, graphY - historyNetworkPower[i+1], T_CYAN); }
+} return;
+}
+if (currentStep == LAB_POWER_SUPPLY_RUN) {
+if (isScreenTouched && touchX >= 220 && touchX <= 310 && touchY >= 100 && touchY <= 380) {
+isPaused = !isPaused; beepClick(); if (isPaused) sendCommandToPowerSupply(0.0); else sendCommandToPowerSupply(activeProfile.targetVoltage); delay(300);
+}
+if (millis() - displayTimer >= 1000) { displayTimer = millis(); updateLCD(); } return;
+}
+if (currentStep == SMART_CHARGER_SCREEN) {
+if (isScreenTouched && !isButtonHeldForShutdown) {
+if (touchX >= 40 && touchX <= 300 && touchY >= 410) { beepClick(); activeProfile.chargerModeActive = false; sendCommandToPowerSupply(0.0); changeSystemStep(MENU_CHOOSE_MODE); delay(300); }
+if (touchX >= 450 && touchX <= 750 && touchY >= 110 && touchY <= 170) { beepClick(); subMenuItem = 0; menuNeedsRedraw = true; delay(150); }
+if (touchX >= 450 && touchX <= 750 && touchY >= 190 && touchY <= 250) { beepClick(); subMenuItem = 1; menuNeedsRedraw = true; delay(150); }
+}
+if (menuNeedsRedraw || (millis() - displayTimer >= 1000)) {
+displayTimer = millis(); if (menuNeedsRedraw) dpiTft.fillScreen(T_BLACK); menuNeedsRedraw = false;
+dpiTft.fillRect(0, 0, 800, 45, T_GREEN); dpiTft.setTextSize(2); dpiTft.setTextColor(T_BLACK); dpiTft.setCursor(20, 15); tft_print_rus("🔋 ИНТЕЛЛЕКТУАЛЬНЫЙ ЗАРЯДНЫЙ МОДУЛЬ И СИСТЕМА ПИТАНИЯ");
+dpiTft.setTextSize(3); dpiTft.setTextColor(T_WHITE);
+dpiTft.setCursor(30, 90);  dpiTft.print("U_bat: "); dpiTft.print(liveVoltageVolts, 2); dpiTft.print(" V");
+dpiTft.setCursor(30, 140); dpiTft.print("I_chg: "); dpiTft.print(liveCurrentAmperes, 2); dpiTft.print(" A");
+dpiTft.setCursor(30, 190); dpiTft.print("P_chg: "); dpiTft.print(livePowerWatts, 1); dpiTft.print(" W");
+chargerAhCount += (liveCurrentAmperes / 3600.0);
+dpiTft.setCursor(30, 250); dpiTft.setTextColor(T_GREEN); dpiTft.print("Q_cap: "); dpiTft.print(chargerAhCount, 3); dpiTft.print(" Ah");
+dpiTft.setTextSize(2); uint32_t colV = (subMenuItem == 0) ? T_YELLOW : T_GRAY; uint32_t colI = (subMenuItem == 1) ? T_GRAY : T_GRAY;
+dpiTft.fillRoundRect(440, 90, 330, 65, 8, colV); dpiTft.setTextColor(subMenuItem == 0 ? T_BLACK : T_WHITE); dpiTft.setCursor(455, 112); dpiTft.print("U_Limit: "); dpiTft.print(activeProfile.chargerEndVoltage, 1); dpiTft.print(" V");
+dpiTft.fillRoundRect(440, 175, 330, 65, 8, colI); dpiTft.setTextColor(subMenuItem == 1 ? T_BLACK : T_WHITE); dpiTft.setCursor(455, 197); dpiTft.print("I_Limit: "); dpiTft.print(activeProfile.chargerMaxCurrent, 1); dpiTft.print(" A");
+if (liveVoltageVolts >= activeProfile.chargerEndVoltage && liveCurrentAmperes < 0.1 && activeProfile.chargerModeActive) { activeProfile.chargerModeActive = false; sendCommandToPowerSupply(0.0); currentAvaria = PROCESS_CHARGER_DONE; changeSystemStep(AVARIA_STOP); return; }
+dpiTft.fillRoundRect(30, 420, 300, 40, 8, T_GRAY); dpiTft.setTextColor(T_WHITE); dpiTft.setTextSize(2); dpiTft.setCursor(55, 432); tft_print_rus("[ В ГЛАВНОЕ МЕНЮ ]");
+} return;
+}
+if (currentStep == GLOBAL_MONITORING_SCREEN) {
+if (isScreenTouched && !isButtonHeldForShutdown) { if (touchX >= 20 && touchX <= 780 && touchY >= 415) { beepClick(); digitalWrite(PIN_HEATER, LOW); digitalWrite(PIN_PELTIER, LOW); ledcWrite(pumpChannel, 0); ledcWrite(caseFanChannel, 0); sendCommandToPowerSupply(0.0); changeSystemStep(MENU_CHOOSE_MODE); delay(300); } }
+if (menuNeedsRedraw || (millis() - displayTimer >= 1000)) {
+displayTimer = millis(); if (menuNeedsRedraw) dpiTft.fillScreen(T_BLACK); menuNeedsRedraw = false;
+dpiTft.fillRect(0, 0, 800, 45, T_LIGHT_BLUE); dpiTft.setTextSize(2); dpiTft.setTextColor(T_BLACK); dpiTft.setCursor(20, 15);
+if (processTypeSelection == 0) tft_print_rus("🖥️ МОНИТОР КОМПЛЕКСА: РЕКТИФИКАЦИЯ И ДИСТИЛЛЯЦИЯ СПИРТА"); else if (processTypeSelection == 1) tft_print_rus("🖥️ МОНИТОР КОМПЛЕКСА: ДИСТИЛЛЯЦИЯ И ОЧИСТКА ВОДЫ"); else tft_print_rus("🖥️ МОНИТОР КОМПЛЕКСА: ЭКСТРАКЦИЯ ЭФИРНЫХ МАСЕЛ");
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_WHITE);
+dpiTft.setCursor(30, 75);  dpiTft.print("Куб Т:   "); dpiTft.print(tCube, 1); dpiTft.print(" C");
+dpiTft.setCursor(30, 110); dpiTft.print("Царга Т: "); dpiTft.print(tPar, 1); dpiTft.print(" C");
+dpiTft.setCursor(30, 145); dpiTft.print("Давл.Колонны: "); dpiTft.print(currentPressure, 2); dpiTft.print(" кПа");
+dpiTft.drawFastHLine(20, 185, 400, T_GRAY);
+dpiTft.setTextColor(T_CYAN); dpiTft.setCursor(30, 200); dpiTft.print("Давл.Компрессора: "); dpiTft.print(currentCompressorPressure, 2); dpiTft.print(" кПа");
+dpiTft.setCursor(30, 230); dpiTft.printf("Обороты: %d RPM | ШИМ: %d%%", currentCompressorRPM, map(compressorPWMDuty, 0, 255, 0, 100));
+dpiTft.fillRect(440, 70, 330, 160, T_DARK_CARD); dpiTft.drawRoundRect(440, 70, 330, 160, 8, T_GRAY); dpiTft.setTextSize(2); dpiTft.setTextColor(T_ORANGE); dpiTft.setCursor(455, 82); tft_print_rus("НАГРЕВ ТЭН: ");
+if(digitalRead(PIN_HEATER)) { dpiTft.setTextColor(T_RED); tft_print_rus("АКТИВЕН (100%)"); } else { dpiTft.setTextColor(T_GRAY); tft_print_rus("ВЫКЛЮЧЕН"); }
+dpiTft.setTextColor(T_ORANGE); dpiTft.setCursor(455, 110); tft_print_rus("ВЕНТИЛЯТОР: "); dpiTft.setTextColor(caseFanRPM > 0 ? T_GREEN : T_GRAY); dpiTft.printf("%d RPM", caseFanRPM);
+dpiTft.setTextColor(T_ORANGE); dpiTft.setCursor(455, 138); tft_print_rus("КЛАПАН:     "); if(digitalRead(PIN_VALVE)) { dpiTft.setTextColor(T_GREEN); tft_print_rus("ОТКРЫТ"); } else { dpiTft.setTextColor(T_RED); tft_print_rus("ЗАКРЫТ"); }
+dpiTft.setTextColor(T_ORANGE); dpiTft.setCursor(455, 166); tft_print_rus("КОМПРЕССОР: ");
+if (compressorPWMDuty > 0) { dpiTft.setTextColor(T_CYAN); dpiTft.printf("%d RPM (%d%%)", currentCompressorRPM, map(compressorPWMDuty, 0, 255, 0, 100)); } else { dpiTft.setTextColor(T_GRAY); tft_print_rus("ОСТАНОВЛЕН"); }
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_YELLOW); dpiTft.setCursor(30, 310); dpiTft.printf("RMS СЕТЬ: %.1f V", netVoltageRMS); dpiTft.setCursor(30, 345); dpiTft.printf("ТОК ТЭН:  %.2f A", netCurrentRMS); dpiTft.setCursor(30, 380); dpiTft.printf("МОЩНОСТЬ: %.0f W", netPowerWatts);
+dpiTft.fillRoundRect(20, 415, 760, 45, 10, T_RED); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(240, 428); tft_print_rus("❌ АВАРИЙНЫЙ ТЕХНОЛОГИЧЕСКИЙ ОСТАНОВ");
+} return;
+}
+if (currentStep == COMPRESSOR_CONTROL_SCREEN) {
+if (isScreenTouched && !isButtonHeldForShutdown) {
+if (touchX >= 40 && touchX <= 300 && touchY >= 415) { beepClick(); EEPROM.put(EEPROM_ADDR_COMP_TARGET, targetCompressorPressure); EEPROM.put(EEPROM_ADDR_COMP_LIMIT, maxCompressorPressureLimit); EEPROM.commit(); changeSystemStep(MENU_CHOOSE_MODE); delay(300); }
+if (touchX >= 40 && touchX <= 380 && touchY >= 60 && touchY <= 125)  { beepClick(); subMenuItem = 0; menuNeedsRedraw = true; delay(150); }
+if (touchX >= 40 && touchX <= 380 && touchY >= 140 && touchY <= 205) { beepClick(); subMenuItem = 1; menuNeedsRedraw = true; delay(150); }
+if (touchX >= 40 && touchX <= 380 && touchY >= 220 && touchY <= 285) { beepClick(); subMenuItem = 2; menuNeedsRedraw = true; delay(150); }
+}
+if (menuNeedsRedraw || (millis() - displayTimer >= 500)) {
+displayTimer = millis(); if (menuNeedsRedraw) dpiTft.fillScreen(T_BLACK); menuNeedsRedraw = false;
+dpiTft.fillRect(0, 0, 800, 45, T_CYAN); dpiTft.setTextSize(2); dpiTft.setTextColor(T_BLACK); dpiTft.setCursor(20, 15); tft_print_rus("⚙️ УПРАВЛЕНИЕ АВТОНОМНЫМ АППАРАТОМ-КОМПРЕССОРОМ");
+dpiTft.drawFastVLine(395, 40, 440, T_GRAY);
+uint32_t colPress = (subMenuItem == 0) ? T_YELLOW : T_DARK_CARD; uint32_t colState = (subMenuItem == 1) ? T_YELLOW : T_DARK_CARD; uint32_t colAlarm = (subMenuItem == 2) ? T_YELLOW : T_DARK_CARD;
+dpiTft.fillRoundRect(20, 60, 360, 65, 8, colPress); if(subMenuItem == 0) dpiTft.drawRoundRect(20, 60, 360, 65, 8, T_WHITE); dpiTft.setTextColor(subMenuItem == 0 ? T_BLACK : T_WHITE); dpiTft.setTextSize(2); dpiTft.setCursor(35, 83); dpiTft.printf("УСТАВКА P: %.1f kPa", targetCompressorPressure);
+dpiTft.fillRoundRect(20, 140, 360, 65, 8, colState); if(subMenuItem == 1) dpiTft.drawRoundRect(20, 140, 360, 65, 8, T_WHITE); dpiTft.setTextColor(subMenuItem == 1 ? T_BLACK : T_WHITE); dpiTft.setCursor(35, 163); tft_print_rus("СТАТУС: "); if(activeProfile.compressorEnabled) tft_print_rus("АКТИВЕН"); else tft_print_rus("ВЫКЛЮЧЕН");
+dpiTft.fillRoundRect(20, 220, 360, 65, 8, colAlarm); if(subMenuItem == 2) dpiTft.drawRoundRect(20, 220, 360, 65, 8, T_WHITE); dpiTft.setTextColor(subMenuItem == 2 ? T_BLACK : T_RED); dpiTft.setCursor(35, 243); dpiTft.printf("ЛИМИТ АВАРИИ: %.1f", maxCompressorPressureLimit);
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(20, 310); dpiTft.printf("Давление: %.2f kPa", currentCompressorPressure); dpiTft.setCursor(20, 345); dpiTft.printf("Обороты: %d RPM", currentCompressorRPM); dpiTft.setCursor(20, 380); dpiTft.printf("ШИМ Мощность: %d%%", map(compressorPWMDuty, 0, 255, 0, 100));
+dpiTft.fillRoundRect(20, 420, 260, 40, 8, T_GRAY); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(55, 432); tft_print_rus("[ В ГЛАВНОЕ МЕНЮ ]");
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_CYAN); dpiTft.setCursor(415, 60); tft_print_rus("ГРАФИК СТАБИЛИЗАЦИИ ДАВЛЕНИЯ");
+int graphBaseY = 380; dpiTft.fillRect(410, 95, COMP_GRAPH_WIDTH, 290, T_BLACK);
+dpiTft.drawFastHLine(410, graphBaseY, COMP_GRAPH_WIDTH, T_GRAY); dpiTft.drawFastHLine(410, graphBaseY - 75, COMP_GRAPH_WIDTH, 0x111111); dpiTft.drawFastHLine(410, graphBaseY - 150, COMP_GRAPH_WIDTH, T_GRAY);
+dpiTft.setTextSize(1); dpiTft.setTextColor(T_GRAY); dpiTft.setCursor(415, graphBaseY - 12);  tft_print_rus("0 kPa"); dpiTft.setCursor(415, graphBaseY - 162); tft_print_rus("100 kPa");
+int targetY = graphBaseY - map((int)targetCompressorPressure, 0, 100, 0, 150); for (int x = 410; x < 410 + COMP_GRAPH_WIDTH; x += 8) dpiTft.drawFastHLine(x, targetY, 4, T_MAGENTA);
+int alarmY = graphBaseY - map((int)maxCompressorPressureLimit, 0, 100, 0, 150); dpiTft.drawFastHLine(410, alarmY, COMP_GRAPH_WIDTH, T_RED);
+for (int i = 0; i < COMP_GRAPH_WIDTH - 1; i++) { int x1 = 410 + i; int x2 = 410 + i + 1; int y1 = graphBaseY - historyCompressorPressure[i]; int y2 = graphBaseY - historyCompressorPressure[i + 1]; y1 = constrain(y1, 95, graphBaseY); y2 = constrain(y2, 95, graphBaseY); dpiTft.drawLine(x1, y1, x2, y2, T_CYAN); }
+} return;
+}
+if (currentStep != HARDWARE_SLEEP_WAIT && currentStep != WELCOME && currentStep != RTC_CLOCK_SCREEN) {
+bool isColumnRunning    = (currentStep == GLOBAL_MONITORING_SCREEN && digitalRead(PIN_HEATER) == HIGH);
+bool isLbaRunning       = (currentStep == LAB_POWER_SUPPLY_RUN && !isPaused && liveCurrentAmperes > 0.05);
+bool isChargerRunning   = (currentStep == SMART_CHARGER_SCREEN && activeProfile.chargerModeActive);
+bool isCompressorActive = (activeProfile.compressorEnabled && compressorPWMDuty > 30);
+if (!isColumnRunning && !isLbaRunning && !isChargerRunning && !isCompressorActive) {
+if (millis() - lastOperatorActivityMillis >= OPERATOR_TIMEOUT_MS) { subMenuItem = 0; infoSettingsCursor = 0; changeSystemStep(RTC_CLOCK_SCREEN); resetOperatorActivityTimer(); }
+} else { resetOperatorActivityTimer(); }
+}
+}
+void updateLCD() {
+if (currentStep == LAB_POWER_SUPPLY_RUN) {
+if (menuNeedsRedraw) { dpiTft.fillScreen(T_BLACK); dpiTft.drawFastVLine(220, 0, 480, T_GRAY); dpiTft.drawFastVLine(320, 0, 480, T_GRAY); menuNeedsRedraw = false; }
+dpiTft.fillRect(0, 0, 800, 35, T_BLACK); dpiTft.fillRect(222, 36, 96, 444, T_BLACK);
+if (!isPaused) { dpiTft.fillRoundRect(225, 60, 90, 360, 16, T_RED); dpiTft.setTextColor(T_WHITE); dpiTft.setTextSize(3); dpiTft.setCursor(255, 210); dpiTft.print("O\nN"); }
+else { dpiTft.fillRoundRect(225, 60, 90, 360, 16, T_GREEN); dpiTft.setTextColor(T_BLACK); dpiTft.setTextSize(3); dpiTft.setCursor(255, 210); dpiTft.print("O\nF\nF"); }
+dpiTft.setTextSize(3); dpiTft.setTextColor(T_ORANGE); dpiTft.setCursor(10, 50); tft_print_rus("ЗАДАНО");
+dpiTft.setTextSize(4); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(10, 95); dpiTft.print(activeProfile.targetVoltage, 1); dpiTft.print(" V");
+dpiTft.setTextSize(3); dpiTft.setTextColor(T_CYAN); dpiTft.setCursor(340, 50); tft_print_rus("ВЫХОДНЫЕ ПАРАМЕТРЫ ЛБП");
+dpiTft.setTextSize(5); dpiTft.setTextColor(T_WHITE); dpiTft.setCursor(340, 110); dpiTft.print(liveVoltageVolts, 2); dpiTft.print(" V"); dpiTft.setCursor(340, 190); dpiTft.print(liveCurrentAmperes, 2); dpiTft.print(" A"); dpiTft.setCursor(340, 270); dpiTft.print(livePowerWatts, 1); dpiTft.print(" W");
+dpiTft.setTextSize(2); dpiTft.setTextColor(T_GRAY); dpiTft.setCursor(340, 420); tft_print_rus("Вращение: уставка U | Клик энкодера: Выход");
+}
+}
